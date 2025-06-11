@@ -39,6 +39,7 @@ def safe_json_dumps(obj: Any) -> str:
 def db_update(table_name: str, key_name: str, key_value: str, index_name: str, update_data: dict) -> Optional[Dict[str, Any]]:
     """
     Updates items in the specified DynamoDB table that match a key value in a GSI.
+    If no items exist, creates a new item with the provided key and update data.
     
     Args:
         table_name (str): Name of the DynamoDB table
@@ -50,54 +51,114 @@ def db_update(table_name: str, key_name: str, key_value: str, index_name: str, u
     Returns:
         dict: Summary of the update operation including number of items updated and any errors
     """
+    logger.info(f"=== Starting db_update operation ===")
+    logger.info(f"Table: {table_name}, Key: {key_name}={key_value}, Index: {index_name}")
+    logger.debug(f"Full update data: {safe_json_dumps(update_data)}")
+    
     table = dynamodb.Table(table_name)
-    logger.info(f"Attempting to update items in table {table_name} with {key_name}={key_value} using index {index_name}")
-    logger.debug(f"Update data: {safe_json_dumps(update_data)}")
     
     try:
         # First, query the GSI to get all matching items
-        logger.info(f"Querying GSI {index_name} for matching items")
-        response = table.query(
-            IndexName=index_name,
-            KeyConditionExpression=f"#{key_name} = :value",
-            ExpressionAttributeNames={
+        logger.info(f"Querying GSI {index_name} for items matching {key_name}={key_value}")
+        query_params = {
+            'IndexName': index_name,
+            'KeyConditionExpression': f"#{key_name} = :value",
+            'ExpressionAttributeNames': {
                 f"#{key_name}": key_name
             },
-            ExpressionAttributeValues={
+            'ExpressionAttributeValues': {
                 ":value": key_value
             }
-        )
+        }
+        logger.debug(f"Query parameters: {safe_json_dumps(query_params)}")
         
+        response = table.query(**query_params)
         items = response.get('Items', [])
+        logger.info(f"Query returned {len(items)} items")
+        
+        # If no items exist, create a new item
         if not items:
-            logger.warning(f"No items found with {key_name}={key_value} in index {index_name}")
-            return {
-                'updated_count': 0,
-                'message': f"No items found with {key_name}={key_value} in index {index_name}"
-            }
+            logger.info(f"No existing items found. Initiating item creation process.")
             
-        logger.info(f"Found {len(items)} items to update")
+            # Create a new item with the key and update data
+            new_item = {key_name: key_value, **update_data}
+            logger.debug(f"Prepared new item data: {safe_json_dumps(new_item)}")
+            
+            try:
+                # Get the table's key schema to determine the primary key
+                logger.info("Retrieving table schema to validate primary key attributes")
+                table_description = dynamodb_client.describe_table(TableName=table_name)
+                key_schema = table_description['Table']['KeySchema']
+                logger.debug(f"Table key schema: {safe_json_dumps(key_schema)}")
+                
+                # Build the primary key for the new item
+                primary_key = {}
+                for key in key_schema:
+                    key_attr_name = key['AttributeName']
+                    logger.debug(f"Checking required key attribute: {key_attr_name}")
+                    if key_attr_name not in new_item:
+                        error_msg = f"Missing required primary key attribute: {key_attr_name}"
+                        logger.error(f"Validation failed: {error_msg}")
+                        logger.error(f"Available attributes: {list(new_item.keys())}")
+                        raise KeyError(error_msg)
+                    primary_key[key_attr_name] = new_item[key_attr_name]
+                
+                logger.info(f"Primary key validation successful: {safe_json_dumps(primary_key)}")
+                
+                # Put the new item
+                logger.info("Attempting to create new item in DynamoDB")
+                put_params = {'Item': new_item}
+                logger.debug(f"PutItem parameters: {safe_json_dumps(put_params)}")
+                
+                table.put_item(**put_params)
+                logger.info(f"Successfully created new item with primary key: {safe_json_dumps(primary_key)}")
+                
+                result = {
+                    'updated_count': 1,
+                    'total_items': 1,
+                    'message': f"Created new item with {key_name}={key_value}",
+                    'operation': 'create',
+                    'primary_key': primary_key
+                }
+                logger.info(f"Creation operation completed successfully: {safe_json_dumps(result)}")
+                return result
+                
+            except Exception as create_error:
+                error_msg = f"Failed to create new item: {str(create_error)}"
+                logger.error(error_msg, exc_info=True)
+                logger.error(f"Failed item data: {safe_json_dumps(new_item)}")
+                return {
+                    'updated_count': 0,
+                    'error': error_msg,
+                    'operation': 'create_failed'
+                }
+        
+        logger.info(f"Processing {len(items)} existing items for update")
         
         # Get the primary key schema
+        logger.info("Retrieving table schema for update operations")
         table_description = dynamodb_client.describe_table(TableName=table_name)
         key_schema = table_description['Table']['KeySchema']
+        logger.debug(f"Table key schema for updates: {safe_json_dumps(key_schema)}")
         
         # Build the update expression and attribute values
         update_expr = "SET "
         expr_attr_values = {}
         expr_attr_names = {}
         
+        logger.info("Building update expression and attribute mappings")
         for i, (attr_name, attr_value) in enumerate(update_data.items()):
             placeholder = f":val{i}"
             name_placeholder = f"#attr{i}"
             update_expr += f"{name_placeholder} = {placeholder}, "
             expr_attr_values[placeholder] = attr_value
             expr_attr_names[name_placeholder] = attr_name
+            logger.debug(f"Added update mapping: {attr_name} -> {safe_json_dumps(attr_value)}")
         
         # Remove trailing comma and space
         update_expr = update_expr[:-2]
         
-        logger.debug(f"Update expression: {update_expr}")
+        logger.debug(f"Final update expression: {update_expr}")
         logger.debug(f"Expression attribute values: {safe_json_dumps(expr_attr_values)}")
         logger.debug(f"Expression attribute names: {safe_json_dumps(expr_attr_names)}")
         
@@ -105,58 +166,78 @@ def db_update(table_name: str, key_name: str, key_value: str, index_name: str, u
         updated_count = 0
         errors = []
         
-        for item in items:
+        for idx, item in enumerate(items, 1):
+            logger.info(f"Processing item {idx} of {len(items)}")
             try:
                 # Build the primary key for this item
                 primary_key = {}
                 for key in key_schema:
                     key_attr_name = key['AttributeName']
                     if key_attr_name not in item:
-                        raise KeyError(f"Item missing required primary key attribute: {key_attr_name}")
+                        error_msg = f"Item {idx} missing required primary key attribute: {key_attr_name}"
+                        logger.error(error_msg)
+                        logger.error(f"Available attributes: {list(item.keys())}")
+                        raise KeyError(error_msg)
                     primary_key[key_attr_name] = item[key_attr_name]
                 
+                logger.debug(f"Item {idx} primary key: {safe_json_dumps(primary_key)}")
+                
                 # Perform the update
-                response = table.update_item(
-                    Key=primary_key,
-                    UpdateExpression=update_expr,
-                    ExpressionAttributeValues=expr_attr_values,
-                    ExpressionAttributeNames=expr_attr_names,
-                    ReturnValues="ALL_NEW"
-                )
+                update_params = {
+                    'Key': primary_key,
+                    'UpdateExpression': update_expr,
+                    'ExpressionAttributeValues': expr_attr_values,
+                    'ExpressionAttributeNames': expr_attr_names,
+                    'ReturnValues': "ALL_NEW"
+                }
+                logger.debug(f"Update parameters for item {idx}: {safe_json_dumps(update_params)}")
+                
+                response = table.update_item(**update_params)
                 updated_count += 1
-                logger.debug(f"Successfully updated item with primary key: {safe_json_dumps(primary_key)}")
+                logger.info(f"Successfully updated item {idx} with primary key: {safe_json_dumps(primary_key)}")
+                logger.debug(f"Update response for item {idx}: {safe_json_dumps(response)}")
                 
             except Exception as item_error:
-                error_msg = f"Failed to update item with primary key {safe_json_dumps(primary_key)}: {str(item_error)}"
-                logger.error(error_msg)
+                error_msg = f"Failed to update item {idx} with primary key {safe_json_dumps(primary_key)}: {str(item_error)}"
+                logger.error(error_msg, exc_info=True)
+                logger.error(f"Failed item data: {safe_json_dumps(item)}")
                 errors.append(error_msg)
         
         result = {
             'updated_count': updated_count,
             'total_items': len(items),
-            'message': f"Successfully updated {updated_count} out of {len(items)} items"
+            'message': f"Successfully updated {updated_count} out of {len(items)} items",
+            'operation': 'update'
         }
         
         if errors:
             result['errors'] = errors
+            logger.warning(f"Update operation completed with {len(errors)} errors")
+        else:
+            logger.info("Update operation completed successfully with no errors")
             
-        logger.info(f"Update operation summary: {safe_json_dumps(result)}")
+        logger.info(f"Final operation summary: {safe_json_dumps(result)}")
         return result
         
     except ClientError as e:
         error_code = e.response['Error']['Code']
         error_message = e.response['Error']['Message']
-        logger.error(f"DynamoDB ClientError: {error_code} - {error_message}")
+        logger.error(f"DynamoDB ClientError: {error_code} - {error_message}", exc_info=True)
+        logger.error(f"Error response: {safe_json_dumps(e.response)}")
         return {
             'updated_count': 0,
-            'error': f"DynamoDB error: {error_message}"
+            'error': f"DynamoDB error: {error_message}",
+            'operation': 'error'
         }
     except Exception as e:
-        logger.error(f"Error updating items in {table_name}: {str(e)}")
+        logger.error(f"Unexpected error in db_update: {str(e)}", exc_info=True)
         return {
             'updated_count': 0,
-            'error': str(e)
+            'error': str(e),
+            'operation': 'error'
         }
+    finally:
+        logger.info("=== Completed db_update operation ===")
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
