@@ -258,7 +258,7 @@ def check_rate_limit(account_id: str) -> Tuple[bool, Optional[str]]:
         # First check the user's rate limit from Users table
         users_table = dynamodb.Table('Users')
         user_response = users_table.get_item(
-            Key={'account_id': account_id},
+            Key={'id': account_id},
             ProjectionExpression='rl_aws'
         )
         
@@ -282,6 +282,8 @@ def check_rate_limit(account_id: str) -> Tuple[bool, Optional[str]]:
             
             if 'Item' in response:
                 current_invocations = response['Item'].get('invocations', 0)
+                logger.info(f"Current invocation count: {current_invocations}")
+                logger.info(f"Max invocations: {max_invocations}")
                 logger.info(f"Current invocation count: {current_invocations}")
                 
                 if current_invocations >= max_invocations:
