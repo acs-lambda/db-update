@@ -322,26 +322,6 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.debug(f"Received event: {safe_json_dumps(event)}")
     
     try:
-        # Extract account ID from the request
-        account_id = event.get('requestContext', {}).get('accountId')
-        if not account_id:
-            logger.error("No account ID found in request context")
-            return {
-                'statusCode': 400,
-                'body': safe_json_dumps({'error': 'Account ID is required'})
-            }
-        
-        # Check rate limits
-        is_allowed, error_message = check_rate_limit(account_id)
-        if not is_allowed:
-            logger.warning(f"Rate limit exceeded for account {account_id}")
-            return {
-                'statusCode': 429,
-                'body': safe_json_dumps({
-                    'error': error_message,
-                    'message': 'Rate limit exceeded. Please try again later.'
-                })
-            }
         
         # Parse request body
         if not event.get('body'):
@@ -362,7 +342,7 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
         
         # Validate required fields
-        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'update_data']
+        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'update_data', 'account_id']
         missing_fields = [field for field in required_fields if field not in body]
         if missing_fields:
             error_msg = f"Missing required fields: {', '.join(missing_fields)}"
@@ -379,6 +359,29 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 'statusCode': 400,
                 'body': safe_json_dumps({'error': 'update_data must be a dictionary'})
             }
+            
+            
+                # Extract account ID from the request
+        account_id = body['account_id']
+        if not account_id:
+            logger.error("No account ID found in request context")
+            return {
+                'statusCode': 400,
+                'body': safe_json_dumps({'error': 'Account ID is required'})
+            }
+        
+        # Check rate limits
+        is_allowed, error_message = check_rate_limit(account_id)
+        if not is_allowed:
+            logger.warning(f"Rate limit exceeded for account {account_id}")
+            return {
+                'statusCode': 429,
+                'body': safe_json_dumps({
+                    'error': error_message,
+                    'message': 'Rate limit exceeded. Please try again later.'
+                })
+            }
+
         
         # Perform the update
         result = db_update(
