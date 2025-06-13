@@ -1,8 +1,9 @@
 import json
 import boto3
 import logging
+import time
 from botocore.exceptions import ClientError
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from decimal import Decimal
 
 # Set up logging with more detailed format
@@ -239,25 +240,109 @@ def db_update(table_name: str, key_name: str, key_value: str, index_name: str, u
     finally:
         logger.info("=== Completed db_update operation ===")
 
+def check_rate_limit(account_id: str) -> Tuple[bool, Optional[str]]:
+    """
+    Checks if the account has exceeded its AWS API rate limit.
+    
+    Args:
+        account_id (str): The AWS account ID to check rate limits for
+        
+    Returns:
+        Tuple[bool, Optional[str]]: (is_allowed, error_message)
+            - is_allowed: True if the request is allowed, False if rate limited
+            - error_message: None if allowed, error message if rate limited
+    """
+    logger.info(f"Checking rate limit for account {account_id}")
+    
+    try:
+        # First check the user's rate limit from Users table
+        users_table = dynamodb.Table('Users')
+        user_response = users_table.get_item(
+            Key={'account_id': account_id},
+            ProjectionExpression='rl_aws'
+        )
+        
+        if 'Item' not in user_response:
+            logger.warning(f"No rate limit found for account {account_id}, defaulting to 0")
+            max_invocations = 0
+        else:
+            max_invocations = user_response['Item'].get('rl_aws', 0)
+            logger.info(f"Found rate limit of {max_invocations} for account {account_id}")
+        
+        # Check current invocation count
+        rl_table = dynamodb.Table('RL_AWS')
+        current_time = int(time.time() * 1000)  # Current time in milliseconds
+        ttl_time = current_time + (60 * 1000)  # 1 minute from now
+        
+        # Try to get existing record
+        try:
+            response = rl_table.get_item(
+                Key={'associated_account': account_id}
+            )
+            
+            if 'Item' in response:
+                current_invocations = response['Item'].get('invocations', 0)
+                logger.info(f"Current invocation count: {current_invocations}")
+                
+                if current_invocations >= max_invocations:
+                    return False, f"Rate limit exceeded. Maximum {max_invocations} invocations per minute allowed."
+                
+                # Update invocation count
+                rl_table.update_item(
+                    Key={'associated_account': account_id},
+                    UpdateExpression='SET invocations = invocations + :inc',
+                    ExpressionAttributeValues={':inc': 1}
+                )
+            else:
+                # Create new record
+                rl_table.put_item(
+                    Item={
+                        'associated_account': account_id,
+                        'invocations': 1,
+                        'ttl': ttl_time
+                    }
+                )
+                logger.info("Created new rate limit record")
+            
+            return True, None
+            
+        except ClientError as e:
+            logger.error(f"Error accessing RL_AWS table: {str(e)}")
+            return False, "Internal error checking rate limits"
+            
+    except Exception as e:
+        logger.error(f"Unexpected error in rate limit check: {str(e)}")
+        return False, "Internal error checking rate limits"
+
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Lambda function handler for database updates.
-    Expects a POST request with JSON body containing:
-    {
-        "table_name": "string",
-        "key_name": "string",
-        "key_value": "string",
-        "index_name": "string",
-        "update_data": {
-            "attribute1": "value1",
-            "attribute2": "value2"
-        }
-    }
+    Lambda function handler for database updates with rate limiting.
     """
     logger.info("Lambda handler started")
     logger.debug(f"Received event: {safe_json_dumps(event)}")
     
     try:
+        # Extract account ID from the request
+        account_id = event.get('requestContext', {}).get('accountId')
+        if not account_id:
+            logger.error("No account ID found in request context")
+            return {
+                'statusCode': 400,
+                'body': safe_json_dumps({'error': 'Account ID is required'})
+            }
+        
+        # Check rate limits
+        is_allowed, error_message = check_rate_limit(account_id)
+        if not is_allowed:
+            logger.warning(f"Rate limit exceeded for account {account_id}")
+            return {
+                'statusCode': 429,
+                'body': safe_json_dumps({
+                    'error': error_message,
+                    'message': 'Rate limit exceeded. Please try again later.'
+                })
+            }
+        
         # Parse request body
         if not event.get('body'):
             logger.error("No request body provided")
