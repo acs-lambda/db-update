@@ -1,3 +1,47 @@
+"""
+Database Update Lambda Function
+==============================
+
+This Lambda function provides secure update operations for DynamoDB records with account-based filtering.
+It ensures that users can only update records that have their account_id as the associated_account.
+
+API Interface
+------------
+Endpoint: POST /db-update
+Authentication: Required (account_id and session)
+
+Request Payload:
+{
+    "table_name": string,      # Required: Name of the DynamoDB table to update
+    "index_name": string,      # Required: Name of the GSI to use for querying
+    "key_name": string,        # Required: Name of the key attribute to query on
+    "key_value": string,       # Required: Value to match against key_name
+    "update_data": object,     # Required: Object containing attributes to update
+    "account_id": string,      # Required: ID of the authenticated user
+    "session": string          # Required: Session token for authentication
+}
+
+Response:
+{
+    "statusCode": number,      # HTTP status code
+    "headers": object,         # CORS headers
+    "body": string            # JSON stringified response body
+}
+
+Status Codes:
+- 200: Success - Records updated successfully
+- 400: Bad Request - Missing required parameters or invalid request format
+- 401: Unauthorized - Invalid or expired session
+- 429: Too Many Requests - Rate limit exceeded
+- 500: Internal Server Error - DynamoDB update failed or rate limit check failed
+
+Security:
+- All requests must include valid account_id and session
+- Records are filtered to only update those where associated_account matches account_id
+- Rate limiting is enforced per account
+- CORS headers are automatically applied
+"""
+
 import json
 import boto3
 import logging
@@ -5,13 +49,15 @@ import time
 from botocore.exceptions import ClientError
 from typing import Dict, Any, Optional, Tuple
 from decimal import Decimal
+from utils import (
+    invoke, parse_event, authorize, validate_update_data,
+    check_rate_limit, fetch_cors_headers, AuthorizationError,
+    UpdateValidationError, safe_json_dumps
+)
 
-# Set up logging with more detailed format
+# Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-for handler in logger.handlers:
-    handler.setFormatter(formatter)
 
 # Initialize DynamoDB resource
 dynamodb = boto3.resource('dynamodb')
@@ -37,7 +83,7 @@ def safe_json_dumps(obj: Any) -> str:
     """
     return json.dumps(obj, cls=DecimalEncoder)
 
-def db_update(table_name: str, key_name: str, key_value: str, index_name: str, update_data: dict) -> Optional[Dict[str, Any]]:
+def db_update(table_name: str, key_name: str, key_value: str, index_name: str, update_data: dict, account_id: str) -> Optional[Dict[str, Any]]:
     """
     Updates items in the specified DynamoDB table that match a key value in a GSI.
     If no items exist, creates a new item with the provided key and update data.
@@ -48,6 +94,7 @@ def db_update(table_name: str, key_name: str, key_value: str, index_name: str, u
         key_value (str): Value to match in the GSI
         index_name (str): Name of the Global Secondary Index to query
         update_data (dict): Dictionary containing the attributes to update
+        account_id (str): ID of the authenticated user
         
     Returns:
         dict: Summary of the update operation including number of items updated and any errors
@@ -56,33 +103,79 @@ def db_update(table_name: str, key_name: str, key_value: str, index_name: str, u
     logger.info(f"Table: {table_name}, Key: {key_name}={key_value}, Index: {index_name}")
     logger.debug(f"Full update data: {safe_json_dumps(update_data)}")
     
+    # Validate update data against table schema
+    try:
+        validate_update_data(table_name, update_data)
+    except UpdateValidationError as e:
+        logger.error(f"Update validation failed: {str(e)}")
+        return {
+            'updated_count': 0,
+            'error': str(e),
+            'operation': 'validation_failed'
+        }
+    
     table = dynamodb.Table(table_name)
     
     try:
+        # Check if associated_account is part of the index name (indicating it's a GSI)
+        is_account_index = 'associated_account' in index_name.lower()
+        logger.info(f"Index {index_name} {'is' if is_account_index else 'is not'} an account-based index")
+        
         # First, query the GSI to get all matching items
         logger.info(f"Querying GSI {index_name} for items matching {key_name}={key_value}")
-        query_params = {
-            'IndexName': index_name,
-            'KeyConditionExpression': f"#{key_name} = :value",
-            'ExpressionAttributeNames': {
-                f"#{key_name}": key_name
-            },
-            'ExpressionAttributeValues': {
-                ":value": key_value
+        
+        if is_account_index:
+            # If associated_account is part of the index, use it as the partition key
+            logger.debug("Using associated_account as partition key in KeyConditionExpression")
+            query_params = {
+                'IndexName': index_name,
+                'KeyConditionExpression': "#account = :account_id",
+                'ExpressionAttributeNames': {
+                    "#account": "associated_account"
+                },
+                'ExpressionAttributeValues': {
+                    ":account_id": account_id
+                }
             }
-        }
+            # Add filter expression for key_name if it's not the sort key
+            if key_name != "associated_account":
+                query_params['FilterExpression'] = f"#{key_name} = :key_value"
+                query_params['ExpressionAttributeNames'][f"#{key_name}"] = key_name
+                query_params['ExpressionAttributeValues'][":key_value"] = key_value
+        else:
+            # If associated_account is not part of the index, use key_name as partition key
+            # and filter by associated_account
+            logger.debug("Using key_name as partition key and filtering by associated_account")
+            query_params = {
+                'IndexName': index_name,
+                'KeyConditionExpression': f"#{key_name} = :key_value",
+                'FilterExpression': "#account = :account_id",
+                'ExpressionAttributeNames': {
+                    f"#{key_name}": key_name,
+                    "#account": "associated_account"
+                },
+                'ExpressionAttributeValues': {
+                    ":key_value": key_value,
+                    ":account_id": account_id
+                }
+            }
+        
         logger.debug(f"Query parameters: {safe_json_dumps(query_params)}")
         
         response = table.query(**query_params)
         items = response.get('Items', [])
-        logger.info(f"Query returned {len(items)} items")
+        logger.info(f"Query returned {len(items)} items for account {account_id}")
         
         # If no items exist, create a new item
         if not items:
             logger.info(f"No existing items found. Initiating item creation process.")
             
             # Create a new item with the key and update data
-            new_item = {key_name: key_value, **update_data}
+            new_item = {
+                key_name: key_value,
+                'associated_account': account_id,
+                **update_data
+            }
             logger.debug(f"Prepared new item data: {safe_json_dumps(new_item)}")
             
             try:
@@ -198,216 +291,162 @@ def db_update(table_name: str, key_name: str, key_value: str, index_name: str, u
                 logger.info(f"Successfully updated item {idx} with primary key: {safe_json_dumps(primary_key)}")
                 logger.debug(f"Update response for item {idx}: {safe_json_dumps(response)}")
                 
-            except Exception as item_error:
-                error_msg = f"Failed to update item {idx} with primary key {safe_json_dumps(primary_key)}: {str(item_error)}"
+            except Exception as e:
+                error_msg = f"Failed to update item {idx}: {str(e)}"
                 logger.error(error_msg, exc_info=True)
-                logger.error(f"Failed item data: {safe_json_dumps(item)}")
                 errors.append(error_msg)
+                continue
         
         result = {
             'updated_count': updated_count,
             'total_items': len(items),
-            'message': f"Successfully updated {updated_count} out of {len(items)} items",
+            'errors': errors if errors else None,
             'operation': 'update'
         }
         
         if errors:
-            result['errors'] = errors
-            logger.warning(f"Update operation completed with {len(errors)} errors")
+            logger.warning(f"Update completed with {len(errors)} errors: {safe_json_dumps(errors)}")
         else:
-            logger.info("Update operation completed successfully with no errors")
+            logger.info(f"Update completed successfully: {safe_json_dumps(result)}")
             
-        logger.info(f"Final operation summary: {safe_json_dumps(result)}")
         return result
         
-    except ClientError as e:
-        error_code = e.response['Error']['Code']
-        error_message = e.response['Error']['Message']
-        logger.error(f"DynamoDB ClientError: {error_code} - {error_message}", exc_info=True)
-        logger.error(f"Error response: {safe_json_dumps(e.response)}")
+    except Exception as e:
+        error_msg = f"Database operation failed: {str(e)}"
+        logger.error(error_msg, exc_info=True)
         return {
             'updated_count': 0,
-            'error': f"DynamoDB error: {error_message}",
-            'operation': 'error'
+            'error': error_msg,
+            'operation': 'failed'
         }
-    except Exception as e:
-        logger.error(f"Unexpected error in db_update: {str(e)}", exc_info=True)
-        return {
-            'updated_count': 0,
-            'error': str(e),
-            'operation': 'error'
-        }
-    finally:
-        logger.info("=== Completed db_update operation ===")
-
-def check_rate_limit(account_id: str) -> Tuple[bool, Optional[str]]:
-    """
-    Checks if the account has exceeded its AWS API rate limit.
-    
-    Args:
-        account_id (str): The AWS account ID to check rate limits for
-        
-    Returns:
-        Tuple[bool, Optional[str]]: (is_allowed, error_message)
-            - is_allowed: True if the request is allowed, False if rate limited
-            - error_message: None if allowed, error message if rate limited
-    """
-    logger.info(f"Checking rate limit for account {account_id}")
-    
-    try:
-        # First check the user's rate limit from Users table
-        users_table = dynamodb.Table('Users')
-        user_response = users_table.get_item(
-            Key={'id': account_id},
-            ProjectionExpression='rl_aws'
-        )
-        
-        if 'Item' not in user_response:
-            logger.warning(f"No rate limit found for account {account_id}, defaulting to 0")
-            max_invocations = 0
-        else:
-            max_invocations = user_response['Item'].get('rl_aws', 0)
-            logger.info(f"Found rate limit of {max_invocations} for account {account_id}")
-        
-        # Check current invocation count
-        rl_table = dynamodb.Table('RL_AWS')
-        current_time = int(time.time())  # Current time in seconds
-        ttl_time = current_time + 60  # 1 minute from now
-        
-        # Try to get existing record
-        try:
-            response = rl_table.get_item(
-                Key={'associated_account': account_id}
-            )
-            
-            if 'Item' in response:
-                current_invocations = response['Item'].get('invocations', 0)
-                logger.info(f"Current invocation count: {current_invocations}")
-                logger.info(f"Max invocations: {max_invocations}")
-                logger.info(f"Current invocation count: {current_invocations}")
-                
-                if current_invocations >= max_invocations:
-                    return False, f"Rate limit exceeded. Maximum {max_invocations} invocations per minute allowed."
-                
-                # Update invocation count
-                rl_table.update_item(
-                    Key={'associated_account': account_id},
-                    UpdateExpression='SET invocations = invocations + :inc',
-                    ExpressionAttributeValues={':inc': 1}
-                )
-            else:
-                # Create new record
-                rl_table.put_item(
-                    Item={
-                        'associated_account': account_id,
-                        'invocations': 1,
-                        'ttl': ttl_time
-                    }
-                )
-                logger.info("Created new rate limit record")
-            
-            return True, None
-            
-        except ClientError as e:
-            logger.error(f"Error accessing RL_AWS table: {str(e)}")
-            return False, "Internal error checking rate limits"
-            
-    except Exception as e:
-        logger.error(f"Unexpected error in rate limit check: {str(e)}")
-        return False, "Internal error checking rate limits"
 
 def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
-    Lambda function handler for database updates with rate limiting.
+    Lambda function handler for database update operations
+    
+    Args:
+        event (Dict[str, Any]): The event from API Gateway or direct Lambda invocation
+        context (Any): Lambda context object
+        
+    Returns:
+        Dict[str, Any]: Response with status code, headers, and body
     """
-    logger.info("Lambda handler started")
+    logger.info("Lambda function started")
     logger.debug(f"Received event: {safe_json_dumps(event)}")
     
+    cors_headers = fetch_cors_headers()
+    logger.debug(f"CORS headers: {safe_json_dumps(cors_headers)}")
+
+    # CORS preflight
+    if event.get('httpMethod') == 'OPTIONS':
+        logger.info("Handling OPTIONS request (CORS preflight)")
+        return {
+            'statusCode': 200,
+            'headers': cors_headers
+        }
+
+    # Parse the event
     try:
+        parsed_event = parse_event(event)
+    except Exception as e:
+        logger.error(f"Error parsing event: {str(e)}")
+        return {
+            'statusCode': 400,
+            'headers': cors_headers,
+            'body': safe_json_dumps({'error': 'Invalid request format'})
+        }
+    
+    # Validate required parameters
+    table_name = parsed_event.get('table_name')
+    index_name = parsed_event.get('index_name')
+    key_name = parsed_event.get('key_name')
+    key_value = parsed_event.get('key_value')
+    update_data = parsed_event.get('update_data')
+    account_id = parsed_event.get('account_id')
+    session_id = parsed_event.get('session_id')
+
+    if not all([table_name, index_name, key_name, key_value, update_data, account_id, session_id]):
+        missing_params = [param for param, value in [
+            ('table_name', table_name),
+            ('index_name', index_name),
+            ('key_name', key_name),
+            ('key_value', key_value),
+            ('update_data', update_data),
+            ('account_id', account_id),
+            ('session_id', session_id)
+        ] if not value]
+        logger.error(f"Missing required parameters: {', '.join(missing_params)}")
+        return {
+            'statusCode': 400,
+            'headers': cors_headers,
+            'body': safe_json_dumps({
+                'error': f"Missing required parameters: {', '.join(missing_params)}"
+            })
+        }
         
-        # Parse request body
-        if not event.get('body'):
-            logger.error("No request body provided")
-            return {
-                'statusCode': 400,
-                'body': safe_json_dumps({'error': 'Request body is required'})
-            }
+    # Authorize the request
+    logger.info("Authorizing request")
+    try:
+        authorize(account_id, session_id)
+    except AuthorizationError as e:
+        logger.error(f"Authorization error: {str(e)}")
+        return {
+            'statusCode': 401,
+            'headers': cors_headers,
+            'body': safe_json_dumps({
+                'error': 'Unauthorized',
+                'message': 'Invalid or expired session'
+            })
+        }
         
-        try:
-            body = json.loads(event['body'])
-            logger.debug(f"Parsed request body: {safe_json_dumps(body)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse request body: {str(e)}")
-            return {
-                'statusCode': 400,
-                'body': safe_json_dumps({'error': 'Invalid JSON in request body'})
-            }
-        
-        # Validate required fields
-        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'update_data']
-        missing_fields = [field for field in required_fields if field not in body]
-        if missing_fields:
-            error_msg = f"Missing required fields: {', '.join(missing_fields)}"
-            logger.error(error_msg)
-            return {
-                'statusCode': 400,
-                'body': safe_json_dumps({'error': error_msg})
-            }
-        
-        # Validate update_data is a dictionary
-        if not isinstance(body['update_data'], dict):
-            logger.error("update_data must be a dictionary")
-            return {
-                'statusCode': 400,
-                'body': safe_json_dumps({'error': 'update_data must be a dictionary'})
-            }
-            
-        # Extract account ID from the request (optional)
-        account_id = body.get('account_id')
-        if not account_id:
-            logger.warning("No account_id provided in request - skipping rate limit checks")
-        else:
-            # Check rate limits only if account_id is provided
-            is_allowed, error_message = check_rate_limit(account_id)
-            if not is_allowed:
-                logger.warning(f"Rate limit exceeded for account {account_id}")
-                return {
-                    'statusCode': 429,
-                    'body': safe_json_dumps({
-                        'error': error_message,
-                        'message': 'Rate limit exceeded. Please try again later.'
-                    })
-                }
-        
-        # Perform the update
+    # Check rate limit
+    is_allowed, error_message = check_rate_limit(account_id, session_id)
+    if not is_allowed:
+        logger.warning(f"Rate limit check failed: {error_message}")
+        status_code = 429 if error_message == "Rate limit exceeded" else 401
+        return {
+            'statusCode': status_code,
+            'headers': cors_headers,
+            'body': safe_json_dumps({
+                'error': error_message
+            })
+        }
+
+    # Perform the update operation
+    try:
         result = db_update(
-            body['table_name'],
-            body['key_name'],
-            body['key_value'],
-            body['index_name'],
-            body['update_data']
+            table_name=table_name,
+            key_name=key_name,
+            key_value=key_value,
+            index_name=index_name,
+            update_data=update_data,
+            account_id=account_id
         )
         
         if result.get('error'):
-            error_msg = result['error']
-            logger.error(error_msg)
+            logger.error(f"Update operation failed: {result['error']}")
             return {
                 'statusCode': 500,
-                'body': safe_json_dumps({'error': error_msg})
+                'headers': cors_headers,
+                'body': safe_json_dumps({
+                    'error': result['error']
+                })
             }
-        
-        logger.info("Update operation completed successfully")
+            
         return {
             'statusCode': 200,
+            'headers': cors_headers,
             'body': safe_json_dumps(result)
         }
         
     except Exception as e:
-        error_msg = f"Internal server error: {str(e)}"
-        logger.error(error_msg, exc_info=True)
+        logger.error(f"Unexpected error during update operation: {str(e)}", exc_info=True)
         return {
             'statusCode': 500,
-            'body': safe_json_dumps({'error': error_msg})
+            'headers': cors_headers,
+            'body': safe_json_dumps({
+                'error': f"Update operation failed: {str(e)}"
+            })
         }
     finally:
-        logger.info("Lambda handler completed")
+        logger.info("Lambda function execution completed")
