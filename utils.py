@@ -96,7 +96,7 @@ def db_select(table_name, index_name, key_name, key_value, account_id, session_i
         'key_name': key_name, 'key_value': key_value,
         'account_id': account_id, 'session_id': session_id
     }
-    response = invoke_lambda('db-select', {'body': json.dumps(payload)})
+    response = invoke_lambda('DBSelect', {'body': json.dumps(payload)})
     return json.loads(response.get('body', '[]'))
 
 def db_update(table_name, key_name, key_value, index_name, update_data, account_id, session_id):
