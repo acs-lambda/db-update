@@ -139,6 +139,7 @@ def lambda_handler(event, context):
             return {'statusCode': 200, 'headers': cors_headers, 'body': ''}
 
         parsed_event = parse_event(event)
+        logger.info(f"Parsed event: {parsed_event}")
         session_id = parsed_event.get('session_id') or parsed_event.get('session')
         account_id = parsed_event.get('account_id') or parsed_event.get('account') or parsed_event.get('client_id')
         

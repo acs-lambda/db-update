@@ -113,4 +113,13 @@ def db_delete(table_name, key_name, key_value, index_name, account_id, session_i
         'index_name': index_name, 'account_id': account_id, 'session_id': session_id
     }
     response = invoke_lambda('db-delete', {'body': json.dumps(payload)})
+    return json.loads(response.get('body', '{}'))
+
+def db_update(table_name, key_name, key_value, index_name, update_data, account_id, session_id):
+    payload = {
+        'table_name': table_name, 'key_name': key_name, 'key_value': key_value,
+        'index_name': index_name, 'update_data': update_data,
+        'account_id': account_id, 'session_id': session_id
+    }
+    response = invoke_lambda('DBUpdate', payload)
     return json.loads(response.get('body', '{}')) 
