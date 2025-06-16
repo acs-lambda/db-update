@@ -183,7 +183,7 @@ def lambda_handler(event, context):
             parsed_event['key_name'],
             parsed_event['key_value'],
             parsed_event['index_name'],
-            parsed_event['update_data'],
+            json.loads(parsed_event['update_data']),
             account_id,
             session_id
         )
