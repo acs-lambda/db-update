@@ -49,7 +49,8 @@ from utils import (
     create_response, LambdaError, parse_event, authorize, 
     DecimalEncoder
 )
-from config import logger
+from utils import invoke_lambda
+from config import logger, AUTH_BP
 from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
@@ -87,7 +88,7 @@ def fetch_cors_headers():
         logger.error(f"Failed to fetch CORS headers: {e}")
         return {}
 
-def db_update_item(table_name, key_name, key_value, index_name, update_data, account_id):
+def db_update_item(table_name, key_name, key_value, index_name, update_data, account_id, session_id):
     """
     Updates or creates an item in DynamoDB, ensuring user authorization.
     """
@@ -143,31 +144,31 @@ def lambda_handler(event, context):
             return {'statusCode': 200, 'headers': cors_headers, 'body': ''}
 
         parsed_event = parse_event(event)
-        body = parsed_event.get('body', {})
+        session_id = parsed_event.get('session_id') or parsed_event.get('session')
         
         if not session_id:
             raise LambdaError(401, "No session ID provided in body or cookies.")
 
         required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'account_id', 'update_expression', 'expression_values']
-        if any(field not in body for field in required_fields):
+        if any(field not in parsed_event for field in required_fields):
             raise LambdaError(400, "Missing one or more required fields.")
         
         if session_id != AUTH_BP:
-            authorize(body['account_id'], session_id)
+            authorize(parsed_event['account_id'], session_id)
             # Check rate limit using the rate-limit Lambda
             rate_limit_response = invoke_lambda('RateLimitAWS', {
-                'client_id': body['account_id'],
+                'client_id': parsed_event['account_id'],
                 'session': session_id
             })
             
             if rate_limit_response.get('statusCode') == 429:
-                logger.warning(f"Rate limit exceeded for account {body['account_id']}")
+                logger.warning(f"Rate limit exceeded for account {parsed_event['account_id']}")
                 return create_response(429, {
                     'error': 'Rate limit exceeded',
                     'message': 'You have exceeded your AWS API rate limit. Please try again later.'
                 })
             elif rate_limit_response.get('statusCode') == 401:
-                logger.warning(f"Unauthorized request for account {body['account_id']}")
+                logger.warning(f"Unauthorized request for account {parsed_event['account_id']}")
                 return create_response(401, {
                     'error': 'Unauthorized',
                     'message': 'Invalid or expired session'
@@ -179,13 +180,13 @@ def lambda_handler(event, context):
                     'message': 'An error occurred while checking rate limits'
                 })
         
-        message = update_db_item(
-            body['table_name'],
-            body['key_name'],
-            body['key_value'],
-            body['index_name'],
-            body['update_data'],
-            body['account_id']
+        message = db_update_item(
+            parsed_event['table_name'],
+            parsed_event['key_name'],
+            parsed_event['key_value'],
+            parsed_event['index_name'],
+            parsed_event['update_data'],
+            parsed_event['account_id']
         )
         
         response = create_response(200, message)

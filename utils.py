@@ -99,14 +99,6 @@ def db_select(table_name, index_name, key_name, key_value, account_id, session_i
     response = invoke_lambda('DBSelect', {'body': json.dumps(payload)})
     return json.loads(response.get('body', '[]'))
 
-def db_update(table_name, key_name, key_value, index_name, update_data, account_id, session_id):
-    payload = {
-        'table_name': table_name, 'key_name': key_name, 'key_value': key_value,
-        'index_name': index_name, 'update_data': update_data,
-        'account_id': account_id, 'session_id': session_id
-    }
-    response = invoke_lambda('db-update', {'body': json.dumps(payload)})
-    return json.loads(response.get('body', '{}'))
 
 def db_delete(table_name, key_name, key_value, index_name, account_id, session_id):
     payload = {

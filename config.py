@@ -6,7 +6,8 @@ log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
-# AWS Region
+# AWS Region\
+AUTH_BP = os.environ.get('AUTH_BP', '')
 AWS_REGION = os.environ.get("AWS_REGION")
 
 if not AWS_REGION:
