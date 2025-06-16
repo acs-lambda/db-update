@@ -29,6 +29,24 @@ def create_response(status_code, body):
         "body": json.dumps(body),
     }
 
+def serialize_for_dynamodb(data):
+    """
+    Safely serialize data for DynamoDB operations.
+    Converts nested dictionaries, lists, and other complex types to JSON strings.
+    """
+    if isinstance(data, dict):
+        serialized = {}
+        for k, v in data.items():
+            if isinstance(v, (dict, list, tuple)):
+                serialized[k] = json.dumps(v)
+            else:
+                serialized[k] = v
+        return serialized
+    elif isinstance(data, (list, tuple)):
+        return json.dumps(data)
+    else:
+        return data
+
 def invoke_lambda(function_name, payload, invocation_type="RequestResponse"):
     try:
         response = lambda_client.invoke(

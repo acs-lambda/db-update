@@ -47,7 +47,7 @@ import boto3
 from botocore.exceptions import ClientError
 from utils import (
     create_response, LambdaError, parse_event, authorize, 
-    DecimalEncoder
+    DecimalEncoder, serialize_for_dynamodb
 )
 from utils import invoke_lambda
 from config import logger, AUTH_BP
@@ -80,6 +80,13 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
     table = dynamodb.Table(table_name)
     
     try:
+        # Validate input parameters
+        if not isinstance(update_data, dict):
+            raise LambdaError(400, "update_data must be a dictionary")
+        
+        if not isinstance(key_value, (str, int, float, bool)) and key_value is not None:
+            raise LambdaError(400, "key_value must be a primitive type (string, number, boolean, or null)")
+        
         # Check if associated_account is part of the index name
         is_associated_account_key = 'associated_account' in index_name.lower()
         
@@ -99,15 +106,21 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         items = response.get('Items', [])
 
         if not items:
-            # Create new item
-            new_item = {key_name: key_value, 'associated_account': account_id, **update_data}
+            # Create new item - ensure update_data doesn't contain nested dicts
+            new_item = {key_name: key_value, 'associated_account': account_id}
+            # Use the helper function to serialize update_data
+            serialized_update_data = serialize_for_dynamodb(update_data)
+            new_item.update(serialized_update_data)
             table.put_item(Item=new_item)
             return {"message": "Successfully created new item.", "operation": "create", "updated_count": 1}
 
         # Update existing items
-        update_expression = "SET " + ", ".join(f"#{k}=:{k}" for k in update_data)
-        expression_attribute_names = {f"#{k}": k for k in update_data}
-        expression_attribute_values = {f":{k}": v for k, v in update_data.items()}
+        # Use the helper function to serialize update_data for DynamoDB compatibility
+        flattened_update_data = serialize_for_dynamodb(update_data)
+        
+        update_expression = "SET " + ", ".join(f"#{k}=:{k}" for k in flattened_update_data.keys())
+        expression_attribute_names = {f"#{k}": k for k in flattened_update_data.keys()}
+        expression_attribute_values = {f":{k}": v for k, v in flattened_update_data.items()}
 
         updated_count = 0
         with table.batch_writer() as batch:
@@ -116,7 +129,21 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
                 if is_associated_account_key and item.get('associated_account') != account_id:
                     continue
                     
-                primary_key = {k: item[k] for k in table.key_schema}
+                # Get the primary key attributes from the table schema
+                key_schema = table.key_schema
+                primary_key = {}
+                for key_attr in key_schema:
+                    attr_name = key_attr['AttributeName']
+                    if attr_name in item:
+                        primary_key[attr_name] = item[attr_name]
+                    else:
+                        logger.warning(f"Primary key attribute {attr_name} not found in item")
+                        continue
+                
+                if not primary_key:
+                    logger.warning(f"Skipping item with no valid primary key: {item}")
+                    continue
+                
                 batch.update_item(
                     Key=primary_key,
                     UpdateExpression=update_expression,
@@ -128,8 +155,15 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         return {"message": f"Successfully updated {updated_count} items.", "operation": "update", "updated_count": updated_count}
 
     except ClientError as e:
-        raise LambdaError(500, f"Database operation failed: {e.response['Error']['Message']}")
+        error_code = e.response['Error']['Code']
+        error_message = e.response['Error']['Message']
+        logger.error(f"DynamoDB ClientError: {error_code} - {error_message}")
+        raise LambdaError(500, f"Database operation failed: {error_message}")
+    except TypeError as e:
+        logger.error(f"TypeError in db_update_item: {e}")
+        raise LambdaError(400, f"Invalid data type provided: {e}")
     except Exception as e:
+        logger.error(f"Unexpected error in db_update_item: {e}", exc_info=True)
         raise LambdaError(500, f"An unexpected error occurred: {e}")
 
 def lambda_handler(event, context):
@@ -140,15 +174,18 @@ def lambda_handler(event, context):
 
         parsed_event = parse_event(event)
         logger.info(f"Parsed event: {parsed_event}")
-        session_id = parsed_event.get('session_id') or parsed_event.get('session') or parsed_event.get('cookies').get('session_id')
+        session_id = parsed_event.get('session_id') or parsed_event.get('session') or parsed_event.get('cookies', {}).get('session_id')
         account_id = parsed_event.get('account_id') or parsed_event.get('account') or parsed_event.get('client_id')
-        
+
         if not session_id:
             raise LambdaError(401, "No session ID provided in body or cookies.")
 
-        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'account_id', 'session_id', 'update_data']
+        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'update_data']
         if any(field not in parsed_event for field in required_fields):
             raise LambdaError(400, "Missing one or more required fields.")
+        
+        if not account_id:
+            raise LambdaError(400, "No account ID provided in body or cookies.")
         
         if session_id != AUTH_BP:
             logger.info(f"Authorizing account {account_id} with session {session_id}")
