@@ -3,8 +3,15 @@ import boto3
 from typing import Dict, Any
 from botocore.exceptions import ClientError
 from config import logger, AWS_REGION
+from decimal import Decimal
 
 lambda_client = boto3.client("lambda", region_name=AWS_REGION)
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return str(obj)
+        return super(DecimalEncoder, self).default(obj)
 
 class LambdaError(Exception):
     def __init__(self, status_code, message):
