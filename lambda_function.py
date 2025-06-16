@@ -145,26 +145,50 @@ def lambda_handler(event, context):
         parsed_event = parse_event(event)
         body = parsed_event.get('body', {})
         
-        required_fields = ['table_name', 'index_name', 'key_name', 'key_value', 'update_data', 'account_id', 'session']
+        if not session_id:
+            raise LambdaError(401, "No session ID provided in body or cookies.")
+
+        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'account_id', 'update_expression', 'expression_values']
         if any(field not in body for field in required_fields):
-            raise LambdaError(400, "Missing required parameters.")
-
-        account_id = body['account_id']
-        session_id = body['session']
-
-        authorize(account_id, session_id)
-        check_rate_limit(account_id, session_id)
-
-        result = db_update_item(
+            raise LambdaError(400, "Missing one or more required fields.")
+        
+        if session_id != AUTH_BP:
+            authorize(body['account_id'], session_id)
+            # Check rate limit using the rate-limit Lambda
+            rate_limit_response = invoke_lambda('RateLimitAWS', {
+                'client_id': body['account_id'],
+                'session': session_id
+            })
+            
+            if rate_limit_response.get('statusCode') == 429:
+                logger.warning(f"Rate limit exceeded for account {body['account_id']}")
+                return create_response(429, {
+                    'error': 'Rate limit exceeded',
+                    'message': 'You have exceeded your AWS API rate limit. Please try again later.'
+                })
+            elif rate_limit_response.get('statusCode') == 401:
+                logger.warning(f"Unauthorized request for account {body['account_id']}")
+                return create_response(401, {
+                    'error': 'Unauthorized',
+                    'message': 'Invalid or expired session'
+                })
+            elif rate_limit_response.get('statusCode') != 200:
+                logger.error(f"Rate limit check failed: {rate_limit_response}")
+                return create_response(500, {
+                    'error': 'Rate limit check failed',
+                    'message': 'An error occurred while checking rate limits'
+                })
+        
+        message = update_db_item(
             body['table_name'],
             body['key_name'],
             body['key_value'],
             body['index_name'],
             body['update_data'],
-            account_id
+            body['account_id']
         )
         
-        response = create_response(200, result)
+        response = create_response(200, message)
         response['headers'].update(cors_headers)
         return response
 
