@@ -56,22 +56,6 @@ from decimal import Decimal
 dynamodb = boto3.resource('dynamodb')
 dynamodb_client = boto3.client('dynamodb')
 
-def validate_update_data(table_name, update_data):
-    try:
-        table_description = dynamodb_client.describe_table(TableName=table_name)
-        attr_types = {attr['AttributeName']: attr['AttributeType'] for attr in table_description['Table']['AttributeDefinitions']}
-        for attr_name, attr_value in update_data.items():
-            if attr_name not in attr_types:
-                raise LambdaError(400, f"Attribute {attr_name} does not exist in table {table_name}")
-            expected_type = attr_types[attr_name]
-            if expected_type == 'S' and not isinstance(attr_value, str):
-                raise LambdaError(400, f"Attribute {attr_name} must be a string")
-            elif expected_type == 'N' and not isinstance(attr_value, (int, float, Decimal)):
-                raise LambdaError(400, f"Attribute {attr_name} must be a number")
-            elif expected_type == 'B' and not isinstance(attr_value, bytes):
-                raise LambdaError(400, f"Attribute {attr_name} must be binary")
-    except ClientError as e:
-        raise LambdaError(500, f"Failed to validate update data: {e.response['Error']['Message']}")
 
 def check_rate_limit(account_id, session_id):
     from utils import invoke_lambda
@@ -92,7 +76,6 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
     """
     Updates or creates an item in DynamoDB, ensuring user authorization.
     """
-    validate_update_data(table_name, update_data)
     
     table = dynamodb.Table(table_name)
     
@@ -145,6 +128,7 @@ def lambda_handler(event, context):
 
         parsed_event = parse_event(event)
         session_id = parsed_event.get('session_id') or parsed_event.get('session')
+        account_id = parsed_event.get('account_id') or parsed_event.get('account') or parsed_event.get('client_id')
         
         if not session_id:
             raise LambdaError(401, "No session ID provided in body or cookies.")
@@ -154,21 +138,21 @@ def lambda_handler(event, context):
             raise LambdaError(400, "Missing one or more required fields.")
         
         if session_id != AUTH_BP:
-            authorize(parsed_event['account_id'], session_id)
+            authorize(account_id, session_id)
             # Check rate limit using the rate-limit Lambda
             rate_limit_response = invoke_lambda('RateLimitAWS', {
-                'client_id': parsed_event['account_id'],
+                'client_id': account_id,
                 'session': session_id
             })
             
             if rate_limit_response.get('statusCode') == 429:
-                logger.warning(f"Rate limit exceeded for account {parsed_event['account_id']}")
+                logger.warning(f"Rate limit exceeded for account {account_id}")
                 return create_response(429, {
                     'error': 'Rate limit exceeded',
                     'message': 'You have exceeded your AWS API rate limit. Please try again later.'
                 })
             elif rate_limit_response.get('statusCode') == 401:
-                logger.warning(f"Unauthorized request for account {parsed_event['account_id']}")
+                logger.warning(f"Unauthorized request for account {account_id}")
                 return create_response(401, {
                     'error': 'Unauthorized',
                     'message': 'Invalid or expired session'
@@ -186,7 +170,8 @@ def lambda_handler(event, context):
             parsed_event['key_value'],
             parsed_event['index_name'],
             parsed_event['update_data'],
-            parsed_event['account_id']
+            account_id,
+            session_id
         )
         
         response = create_response(200, message)
