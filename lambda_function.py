@@ -80,13 +80,21 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
     table = dynamodb.Table(table_name)
     
     try:
+        # Check if associated_account is part of the index name
+        is_associated_account_key = 'associated_account' in index_name.lower()
+        
         # Query to find items to update
         query_params = {
             'IndexName': index_name,
             'KeyConditionExpression': f"{key_name} = :key_value",
-            'FilterExpression': "associated_account = :account_id",
-            'ExpressionAttributeValues': {':key_value': key_value, ':account_id': account_id}
+            'ExpressionAttributeValues': {':key_value': key_value}
         }
+        
+        # Only add associated_account filter if it's not part of the index key
+        if not is_associated_account_key:
+            query_params['FilterExpression'] = "associated_account = :account_id"
+            query_params['ExpressionAttributeValues'][':account_id'] = account_id
+        
         response = table.query(**query_params)
         items = response.get('Items', [])
 
@@ -104,6 +112,10 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         updated_count = 0
         with table.batch_writer() as batch:
             for item in items:
+                # If associated_account is the key, verify it matches account_id
+                if is_associated_account_key and item.get('associated_account') != account_id:
+                    continue
+                    
                 primary_key = {k: item[k] for k in table.key_schema}
                 batch.update_item(
                     Key=primary_key,
