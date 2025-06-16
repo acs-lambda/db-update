@@ -140,7 +140,7 @@ def lambda_handler(event, context):
 
         parsed_event = parse_event(event)
         logger.info(f"Parsed event: {parsed_event}")
-        session_id = parsed_event.get('session_id') or parsed_event.get('session')
+        session_id = parsed_event.get('session_id') or parsed_event.get('session') or json.loads(parsed_event.get('cookies')).get('session_id')
         account_id = parsed_event.get('account_id') or parsed_event.get('account') or parsed_event.get('client_id')
         
         if not session_id:
