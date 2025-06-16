@@ -150,6 +150,7 @@ def lambda_handler(event, context):
             raise LambdaError(400, "Missing one or more required fields.")
         
         if session_id != AUTH_BP:
+            logger.info(f"Authorizing account {account_id} with session {session_id}")
             authorize(account_id, session_id)
             # Check rate limit using the rate-limit Lambda
             rate_limit_response = invoke_lambda('RateLimitAWS', {
