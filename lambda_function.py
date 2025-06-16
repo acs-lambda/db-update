@@ -149,7 +149,7 @@ def lambda_handler(event, context):
         if not session_id:
             raise LambdaError(401, "No session ID provided in body or cookies.")
 
-        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'account_id', 'update_expression', 'expression_values']
+        required_fields = ['table_name', 'key_name', 'key_value', 'index_name', 'account_id', 'session_id', 'update_data']
         if any(field not in parsed_event for field in required_fields):
             raise LambdaError(400, "Missing one or more required fields.")
         
