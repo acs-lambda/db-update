@@ -123,34 +123,38 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         expression_attribute_values = {f":{k}": v for k, v in flattened_update_data.items()}
 
         updated_count = 0
-        with table.batch_writer() as batch:
-            for item in items:
-                # If associated_account is the key, verify it matches account_id
-                if is_associated_account_key and item.get('associated_account') != account_id:
-                    continue
-                    
-                # Get the primary key attributes from the table schema
-                key_schema = table.key_schema
-                primary_key = {}
-                for key_attr in key_schema:
-                    attr_name = key_attr['AttributeName']
-                    if attr_name in item:
-                        primary_key[attr_name] = item[attr_name]
-                    else:
-                        logger.warning(f"Primary key attribute {attr_name} not found in item")
-                        continue
+        for item in items:
+            # If associated_account is the key, verify it matches account_id
+            if is_associated_account_key and item.get('associated_account') != account_id:
+                continue
                 
-                if not primary_key:
-                    logger.warning(f"Skipping item with no valid primary key: {item}")
+            # Get the primary key attributes from the table schema
+            key_schema = table.key_schema
+            primary_key = {}
+            for key_attr in key_schema:
+                attr_name = key_attr['AttributeName']
+                if attr_name in item:
+                    primary_key[attr_name] = item[attr_name]
+                else:
+                    logger.warning(f"Primary key attribute {attr_name} not found in item")
                     continue
-                
-                batch.update_item(
+            
+            if not primary_key:
+                logger.warning(f"Skipping item with no valid primary key: {item}")
+                continue
+            
+            try:
+                table.update_item(
                     Key=primary_key,
                     UpdateExpression=update_expression,
                     ExpressionAttributeNames=expression_attribute_names,
                     ExpressionAttributeValues=expression_attribute_values
                 )
                 updated_count += 1
+            except ClientError as e:
+                logger.error(f"Failed to update item with key {primary_key}: {e}")
+                # Continue with other items instead of failing completely
+                continue
         
         return {"message": f"Successfully updated {updated_count} items.", "operation": "update", "updated_count": updated_count}
 
