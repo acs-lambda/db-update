@@ -47,12 +47,45 @@ import boto3
 from botocore.exceptions import ClientError
 from utils import (
     create_response, LambdaError, parse_event, authorize, 
-    validate_update_data, check_rate_limit, fetch_cors_headers,
     DecimalEncoder
 )
 from config import logger
+from decimal import Decimal
 
 dynamodb = boto3.resource('dynamodb')
+dynamodb_client = boto3.client('dynamodb')
+
+def validate_update_data(table_name, update_data):
+    try:
+        table_description = dynamodb_client.describe_table(TableName=table_name)
+        attr_types = {attr['AttributeName']: attr['AttributeType'] for attr in table_description['Table']['AttributeDefinitions']}
+        for attr_name, attr_value in update_data.items():
+            if attr_name not in attr_types:
+                raise LambdaError(400, f"Attribute {attr_name} does not exist in table {table_name}")
+            expected_type = attr_types[attr_name]
+            if expected_type == 'S' and not isinstance(attr_value, str):
+                raise LambdaError(400, f"Attribute {attr_name} must be a string")
+            elif expected_type == 'N' and not isinstance(attr_value, (int, float, Decimal)):
+                raise LambdaError(400, f"Attribute {attr_name} must be a number")
+            elif expected_type == 'B' and not isinstance(attr_value, bytes):
+                raise LambdaError(400, f"Attribute {attr_name} must be binary")
+    except ClientError as e:
+        raise LambdaError(500, f"Failed to validate update data: {e.response['Error']['Message']}")
+
+def check_rate_limit(account_id, session_id):
+    from utils import invoke_lambda
+    response = invoke_lambda('RateLimitAWS', {'client_id': account_id, 'session': session_id})
+    if response.get('statusCode') != 200:
+        raise LambdaError(response.get('statusCode', 429), response.get('body', {}).get('message', 'Rate limit check failed.'))
+
+def fetch_cors_headers():
+    from utils import invoke_lambda
+    try:
+        response = invoke_lambda('Allow-Cors', {})
+        return response.get('headers', {})
+    except Exception as e:
+        logger.error(f"Failed to fetch CORS headers: {e}")
+        return {}
 
 def db_update_item(table_name, key_name, key_value, index_name, update_data, account_id):
     """
