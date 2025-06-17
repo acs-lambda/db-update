@@ -170,7 +170,7 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
 
         if not items:
             # Create new item - ensure update_data doesn't contain nested dicts
-            new_item = {key_name: key_value, 'associated_account': account_id}
+            new_item = {key_name: key_value}
             # Use the helper function to serialize update_data
             serialized_update_data = serialize_for_dynamodb(cleaned_update_data)
             new_item.update(serialized_update_data)
@@ -222,9 +222,12 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
                 
                 # Update with new attributes (this will override existing ones with new values)
                 for attr_name, attr_value in flattened_update_data.items():
-                    old_value = merged_item.get(attr_name, "NOT_PRESENT")
-                    merged_item[attr_name] = attr_value
-                    logger.info(f"Merged attribute '{attr_name}': '{old_value}' -> '{attr_value}'")
+                    if attr_value is not None:
+                        old_value = merged_item.get(attr_name, "NOT_PRESENT")
+                        merged_item[attr_name] = attr_value
+                        logger.info(f"Merged attribute '{attr_name}': '{old_value}' -> '{attr_value}'")
+                    else:
+                        logger.info(f"Skipped merging attribute '{attr_name}' because value is None (preserving existing value)")
                 
                 # Log the final merged item for debugging
                 logger.info(f"Final merged item attributes: {list(merged_item.keys())}")
