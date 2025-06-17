@@ -7,9 +7,14 @@ It ensures that users can only update records that have their account_id as the 
 
 Attribute Collision Handling:
 - If the same attribute name appears multiple times in update_data, the last occurrence takes precedence
-- If attribute name placeholders collide during expression building, unique suffixes are added
 - All existing attributes not being updated are preserved during the update operation
 - Complex data types (dicts, lists) are automatically serialized to JSON strings
+- Uses put_item with merge strategy to ensure complete attribute preservation
+
+Update Strategy:
+- For new items: Creates a new item with all provided attributes
+- For existing items: Merges existing item with new update_data, preserving all existing attributes
+- This approach is more reliable than DynamoDB's SET operation for ensuring attribute persistence
 
 API Interface
 ------------
@@ -174,63 +179,15 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
 
         # Update existing items
         # Use the helper function to serialize update_data for DynamoDB compatibility
-        flattened_update_data = serialize_for_dynamodb(cleaned_update_data)
+        try:
+            flattened_update_data = serialize_for_dynamodb(cleaned_update_data)
+        except ValueError as e:
+            logger.error(f"Serialization failed: {e}")
+            raise LambdaError(400, f"Failed to serialize update data: {e}")
         
         # Log the update data for debugging
         logger.info(f"Updating items with data: {flattened_update_data}")
         
-        # Build update expression with proper attribute name handling and collision resolution
-        update_parts = []
-        expression_attribute_names = {}
-        expression_attribute_values = {}
-        
-        # Track used placeholders to avoid collisions
-        used_placeholders = set()
-        used_attr_names = set()
-        
-        for attr_name, attr_value in flattened_update_data.items():
-            # Create safe attribute name placeholder with collision detection
-            base_placeholder = attr_name.replace('-', '_').replace('.', '_')
-            attr_placeholder = f"#{base_placeholder}"
-            value_placeholder = f":{base_placeholder}"
-            
-            # Handle collisions by adding a counter suffix
-            counter = 1
-            while attr_placeholder in used_placeholders:
-                attr_placeholder = f"#{base_placeholder}_{counter}"
-                value_placeholder = f":{base_placeholder}_{counter}"
-                counter += 1
-            
-            # Handle attribute name collisions by ensuring newer values take precedence
-            if attr_name in used_attr_names:
-                logger.warning(f"Attribute name collision detected for '{attr_name}'. Newer value will take precedence.")
-                # Remove the previous entry for this attribute name
-                for existing_placeholder, existing_attr_name in list(expression_attribute_names.items()):
-                    if existing_attr_name == attr_name:
-                        del expression_attribute_names[existing_placeholder]
-                        # Also remove from expression_attribute_values
-                        for existing_value_placeholder in list(expression_attribute_values.keys()):
-                            if existing_value_placeholder.replace(':', '#') == existing_placeholder.replace('#', ':'):
-                                del expression_attribute_values[existing_value_placeholder]
-                        # Remove from update_parts
-                        update_parts = [part for part in update_parts if not part.startswith(f"{existing_placeholder} =")]
-                        break
-            
-            update_parts.append(f"{attr_placeholder} = {value_placeholder}")
-            expression_attribute_names[attr_placeholder] = attr_name
-            expression_attribute_values[value_placeholder] = attr_value
-            
-            used_placeholders.add(attr_placeholder)
-            used_attr_names.add(attr_name)
-            
-            logger.info(f"Added attribute '{attr_name}' with placeholder '{attr_placeholder}' and value '{attr_value}'")
-        
-        update_expression = "SET " + ", ".join(update_parts)
-        
-        logger.info(f"Final update expression: {update_expression}")
-        logger.info(f"Final expression attribute names: {expression_attribute_names}")
-        logger.info(f"Final expression attribute values: {expression_attribute_values}")
-
         updated_count = 0
         for item in items:
             # If associated_account is the key, verify it matches account_id
@@ -256,12 +213,36 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
             logger.info(f"Updating item with key {primary_key}, current item: {item}")
             
             try:
-                table.update_item(
-                    Key=primary_key,
-                    UpdateExpression=update_expression,
-                    ExpressionAttributeNames=expression_attribute_names,
-                    ExpressionAttributeValues=expression_attribute_values
-                )
+                # Create a merged item that preserves all existing attributes
+                merged_item = item.copy()  # Start with all existing attributes
+                
+                # Log the original item for debugging
+                logger.info(f"Original item attributes: {list(item.keys())}")
+                logger.info(f"Original item: {item}")
+                
+                # Update with new attributes (this will override existing ones with new values)
+                for attr_name, attr_value in flattened_update_data.items():
+                    old_value = merged_item.get(attr_name, "NOT_PRESENT")
+                    merged_item[attr_name] = attr_value
+                    logger.info(f"Merged attribute '{attr_name}': '{old_value}' -> '{attr_value}'")
+                
+                # Log the final merged item for debugging
+                logger.info(f"Final merged item attributes: {list(merged_item.keys())}")
+                logger.info(f"Final merged item: {merged_item}")
+                
+                # Verify that all original attributes are preserved
+                missing_attributes = []
+                for attr_name in item.keys():
+                    if attr_name not in merged_item:
+                        missing_attributes.append(attr_name)
+                
+                if missing_attributes:
+                    logger.warning(f"Missing attributes after merge: {missing_attributes}")
+                else:
+                    logger.info("All original attributes preserved in merged item")
+                
+                # Use put_item to ensure all attributes are preserved
+                table.put_item(Item=merged_item)
                 updated_count += 1
                 logger.info(f"Successfully updated item with key {primary_key}")
             except ClientError as e:

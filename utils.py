@@ -29,6 +29,60 @@ def create_response(status_code, body):
         "body": json.dumps(body),
     }
 
+def verify_serialization(data, serialized_data):
+    """
+    Verifies that the serialization process didn't lose any data.
+    Returns True if verification passes, False otherwise.
+    """
+    logger.info(f"Verifying serialization: original={data}, serialized={serialized_data}")
+    
+    if isinstance(data, dict) and isinstance(serialized_data, dict):
+        # Check that all keys are preserved
+        original_keys = set(data.keys())
+        serialized_keys = set(serialized_data.keys())
+        
+        if original_keys != serialized_keys:
+            missing_keys = original_keys - serialized_keys
+            extra_keys = serialized_keys - original_keys
+            logger.error(f"Serialization verification failed: missing_keys={missing_keys}, extra_keys={extra_keys}")
+            return False
+        
+        # Check that values are properly converted
+        for key in original_keys:
+            original_value = data[key]
+            serialized_value = serialized_data[key]
+            
+            if isinstance(original_value, (dict, list, tuple)):
+                # Complex types should be converted to JSON strings
+                if not isinstance(serialized_value, str):
+                    logger.error(f"Serialization verification failed for key '{key}': complex type not converted to string")
+                    return False
+                # Verify JSON can be parsed back
+                try:
+                    json.loads(serialized_value)
+                except json.JSONDecodeError:
+                    logger.error(f"Serialization verification failed for key '{key}': invalid JSON string")
+                    return False
+            else:
+                # Primitive types should be preserved as-is
+                if original_value != serialized_value:
+                    logger.error(f"Serialization verification failed for key '{key}': value changed from {original_value} to {serialized_value}")
+                    return False
+        
+        logger.info("Serialization verification passed")
+        return True
+    else:
+        # For non-dict types, just check if they're properly converted
+        if isinstance(data, (dict, list, tuple)) and not isinstance(serialized_data, str):
+            logger.error(f"Serialization verification failed: complex type not converted to string")
+            return False
+        elif data != serialized_data:
+            logger.error(f"Serialization verification failed: value changed from {data} to {serialized_data}")
+            return False
+        
+        logger.info("Serialization verification passed")
+        return True
+
 def serialize_for_dynamodb(data):
     """
     Safely serialize data for DynamoDB operations.
@@ -68,13 +122,31 @@ def serialize_for_dynamodb(data):
             logger.info(f"Resolved {collision_count} attribute name collisions in input data")
         
         logger.info(f"Serialized result: {serialized}")
+        
+        # Verify the serialization didn't lose data
+        if not verify_serialization(data, serialized):
+            logger.error("Serialization verification failed - data may have been lost")
+            raise ValueError("Serialization verification failed - data may have been lost")
+        
         return serialized
     elif isinstance(data, (list, tuple)):
         json_str = json.dumps(data)
         logger.info(f"Serialized list/tuple to JSON string: {json_str}")
+        
+        # Verify the serialization
+        if not verify_serialization(data, json_str):
+            logger.error("Serialization verification failed - data may have been lost")
+            raise ValueError("Serialization verification failed - data may have been lost")
+        
         return json_str
     else:
         logger.info(f"Serialized primitive value: {data}")
+        
+        # Verify the serialization
+        if not verify_serialization(data, data):
+            logger.error("Serialization verification failed - data may have been lost")
+            raise ValueError("Serialization verification failed - data may have been lost")
+        
         return data
 
 def invoke_lambda(function_name, payload, invocation_type="RequestResponse"):
