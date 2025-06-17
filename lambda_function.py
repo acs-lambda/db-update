@@ -68,12 +68,6 @@ dynamodb = boto3.resource('dynamodb')
 dynamodb_client = boto3.client('dynamodb')
 
 
-def check_rate_limit(account_id, session_id):
-    from utils import invoke_lambda
-    response = invoke_lambda('RateLimitAWS', {'client_id': account_id, 'session': session_id})
-    if response.get('statusCode') != 200:
-        raise LambdaError(response.get('statusCode', 429), response.get('body', {}).get('message', 'Rate limit check failed.'))
-
 def fetch_cors_headers():
     from utils import invoke_lambda
     try:
@@ -86,7 +80,7 @@ def fetch_cors_headers():
 def validate_and_clean_update_data(update_data):
     """
     Validates and cleans update data to ensure it's suitable for DynamoDB operations.
-    Handles edge cases and provides detailed error messages.
+    Returns cleaned data ready for serialization.
     """
     if not isinstance(update_data, dict):
         raise LambdaError(400, "update_data must be a dictionary")
@@ -95,17 +89,14 @@ def validate_and_clean_update_data(update_data):
         raise LambdaError(400, "update_data cannot be empty")
     
     cleaned_data = {}
-    invalid_keys = []
     
     for key, value in update_data.items():
         # Validate key
         if not isinstance(key, str):
-            invalid_keys.append(f"Key '{key}' is not a string")
-            continue
+            raise LambdaError(400, f"All keys must be strings, found: {type(key)}")
         
         if not key.strip():
-            invalid_keys.append("Empty key found")
-            continue
+            raise LambdaError(400, "Empty keys are not allowed")
         
         # Check for reserved DynamoDB words (basic check)
         reserved_words = {
@@ -116,28 +107,16 @@ def validate_and_clean_update_data(update_data):
         if key.lower() in reserved_words:
             logger.warning(f"Key '{key}' is a DynamoDB reserved word. This may cause issues.")
         
-        # Validate value
-        if value is None:
-            cleaned_data[key] = None
-        elif isinstance(value, (str, int, float, bool)):
-            cleaned_data[key] = value
-        elif isinstance(value, (dict, list, tuple)):
-            # Complex types will be serialized to JSON strings
-            cleaned_data[key] = value
-        else:
-            # Convert other types to string
-            cleaned_data[key] = str(value)
-            logger.info(f"Converted value for key '{key}' to string: {value}")
+        # Store the value as-is - serialization will handle type conversion
+        cleaned_data[key] = value
     
-    if invalid_keys:
-        raise LambdaError(400, f"Invalid keys found: {', '.join(invalid_keys)}")
-    
-    logger.info(f"Validated and cleaned update data: {cleaned_data}")
+    logger.info(f"Validated update data with {len(cleaned_data)} attributes")
     return cleaned_data
 
 def db_update_item(table_name, key_name, key_value, index_name, update_data, account_id, session_id):
     """
-    Updates or creates an item in DynamoDB, ensuring user authorization.
+    Updates or creates an item in DynamoDB using put_item with graceful merge strategy.
+    This approach ensures all existing attributes are preserved while adding/updating new ones.
     """
     
     table = dynamodb.Table(table_name)
@@ -150,10 +129,31 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         # Validate and clean update_data
         cleaned_update_data = validate_and_clean_update_data(update_data)
         
+        # Serialize update data for DynamoDB compatibility
+        try:
+            serialized_update_data = serialize_for_dynamodb(cleaned_update_data)
+        except ValueError as e:
+            logger.error(f"Serialization failed: {e}")
+            raise LambdaError(400, f"Failed to serialize update data: {e}")
+        
+        # Get the table's key schema to understand the primary key structure
+        key_schema = table.key_schema
+        primary_key_attrs = [key_attr['AttributeName'] for key_attr in key_schema]
+        
+        logger.info(f"Table key schema: {primary_key_attrs}")
+        logger.info(f"Key name: {key_name}, Key value: {key_value}")
+        
         # Check if associated_account is part of the index name
         is_associated_account_key = 'associated_account' in index_name.lower()
         
-        # Query to find items to update
+        # Build the base item with the key attributes
+        base_item = {key_name: key_value}
+        
+        # If associated_account is not part of the key and not in the index, add it
+        if not is_associated_account_key and 'associated_account' not in primary_key_attrs:
+            base_item['associated_account'] = account_id
+        
+        # Query to find existing items that match our criteria
         query_params = {
             'IndexName': index_name,
             'KeyConditionExpression': f"{key_name} = :key_value",
@@ -166,94 +166,81 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
             query_params['ExpressionAttributeValues'][':account_id'] = account_id
         
         response = table.query(**query_params)
-        items = response.get('Items', [])
-
-        if not items:
-            # Create new item - ensure update_data doesn't contain nested dicts
-            new_item = {key_name: key_value}
-            # Use the helper function to serialize update_data
-            serialized_update_data = serialize_for_dynamodb(cleaned_update_data)
+        existing_items = response.get('Items', [])
+        
+        logger.info(f"Found {len(existing_items)} existing items")
+        
+        if not existing_items:
+            # Create new item - merge base item with update data
+            new_item = base_item.copy()
             new_item.update(serialized_update_data)
+            
+            logger.info(f"Creating new item: {new_item}")
             table.put_item(Item=new_item)
-            return {"message": "Successfully created new item.", "operation": "create", "updated_count": 1}
-
+            
+            return {
+                "message": "Successfully created new item.",
+                "operation": "create", 
+                "updated_count": 1,
+                "item_created": True
+            }
+        
         # Update existing items
-        # Use the helper function to serialize update_data for DynamoDB compatibility
-        try:
-            flattened_update_data = serialize_for_dynamodb(cleaned_update_data)
-        except ValueError as e:
-            logger.error(f"Serialization failed: {e}")
-            raise LambdaError(400, f"Failed to serialize update data: {e}")
-        
-        # Log the update data for debugging
-        logger.info(f"Updating items with data: {flattened_update_data}")
-        
         updated_count = 0
-        for item in items:
-            # If associated_account is the key, verify it matches account_id
-            if is_associated_account_key and item.get('associated_account') != account_id:
+        for existing_item in existing_items:
+            # Verify authorization if associated_account is the key
+            if is_associated_account_key and existing_item.get('associated_account') != account_id:
+                logger.warning(f"Skipping item with mismatched associated_account: {existing_item.get('associated_account')} != {account_id}")
                 continue
-                
-            # Get the primary key attributes from the table schema
-            key_schema = table.key_schema
-            primary_key = {}
-            for key_attr in key_schema:
-                attr_name = key_attr['AttributeName']
-                if attr_name in item:
-                    primary_key[attr_name] = item[attr_name]
+            
+            # Build the complete item by merging existing item with update data
+            merged_item = existing_item.copy()  # Start with all existing attributes
+            
+            # Apply updates (new values will override existing ones)
+            for attr_name, attr_value in serialized_update_data.items():
+                if attr_value is not None:
+                    old_value = merged_item.get(attr_name, "NOT_PRESENT")
+                    merged_item[attr_name] = attr_value
+                    logger.info(f"Updating attribute '{attr_name}': '{old_value}' -> '{attr_value}'")
                 else:
-                    logger.warning(f"Primary key attribute {attr_name} not found in item")
-                    continue
+                    # If update value is None, remove the attribute (DynamoDB behavior)
+                    # But don't remove key attributes
+                    if attr_name in primary_key_attrs:
+                        logger.warning(f"Cannot remove key attribute '{attr_name}', skipping")
+                        continue
+                    
+                    if attr_name in merged_item:
+                        removed_value = merged_item.pop(attr_name)
+                        logger.info(f"Removing attribute '{attr_name}' with value '{removed_value}'")
+                    else:
+                        logger.info(f"Attribute '{attr_name}' not present, skipping removal")
             
-            if not primary_key:
-                logger.warning(f"Skipping item with no valid primary key: {item}")
+            # Ensure all required key attributes are present
+            missing_key_attrs = []
+            for key_attr in primary_key_attrs:
+                if key_attr not in merged_item:
+                    missing_key_attrs.append(key_attr)
+            
+            if missing_key_attrs:
+                logger.error(f"Missing required key attributes in merged item: {missing_key_attrs}")
                 continue
-            
-            # Log the item being updated for debugging
-            logger.info(f"Updating item with key {primary_key}, current item: {item}")
             
             try:
-                # Create a merged item that preserves all existing attributes
-                merged_item = item.copy()  # Start with all existing attributes
-                
-                # Log the original item for debugging
-                logger.info(f"Original item attributes: {list(item.keys())}")
-                logger.info(f"Original item: {item}")
-                
-                # Update with new attributes (this will override existing ones with new values)
-                for attr_name, attr_value in flattened_update_data.items():
-                    if attr_value is not None:
-                        old_value = merged_item.get(attr_name, "NOT_PRESENT")
-                        merged_item[attr_name] = attr_value
-                        logger.info(f"Merged attribute '{attr_name}': '{old_value}' -> '{attr_value}'")
-                    else:
-                        logger.info(f"Skipped merging attribute '{attr_name}' because value is None (preserving existing value)")
-                
-                # Log the final merged item for debugging
-                logger.info(f"Final merged item attributes: {list(merged_item.keys())}")
-                logger.info(f"Final merged item: {merged_item}")
-                
-                # Verify that all original attributes are preserved
-                missing_attributes = []
-                for attr_name in item.keys():
-                    if attr_name not in merged_item:
-                        missing_attributes.append(attr_name)
-                
-                if missing_attributes:
-                    logger.warning(f"Missing attributes after merge: {missing_attributes}")
-                else:
-                    logger.info("All original attributes preserved in merged item")
-                
-                # Use put_item to ensure all attributes are preserved
+                logger.info(f"Putting merged item: {merged_item}")
                 table.put_item(Item=merged_item)
                 updated_count += 1
-                logger.info(f"Successfully updated item with key {primary_key}")
+                logger.info(f"Successfully updated item")
             except ClientError as e:
-                logger.error(f"Failed to update item with key {primary_key}: {e}")
+                logger.error(f"Failed to update item: {e}")
                 # Continue with other items instead of failing completely
                 continue
         
-        return {"message": f"Successfully updated {updated_count} items.", "operation": "update", "updated_count": updated_count}
+        return {
+            "message": f"Successfully updated {updated_count} items.",
+            "operation": "update", 
+            "updated_count": updated_count,
+            "item_created": False
+        }
 
     except ClientError as e:
         error_code = e.response['Error']['Code']
