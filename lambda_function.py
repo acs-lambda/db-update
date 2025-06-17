@@ -5,6 +5,12 @@ Database Update Lambda Function
 This Lambda function provides secure update operations for DynamoDB records with account-based filtering.
 It ensures that users can only update records that have their account_id as the associated_account.
 
+Attribute Collision Handling:
+- If the same attribute name appears multiple times in update_data, the last occurrence takes precedence
+- If attribute name placeholders collide during expression building, unique suffixes are added
+- All existing attributes not being updated are preserved during the update operation
+- Complex data types (dicts, lists) are automatically serialized to JSON strings
+
 API Interface
 ------------
 Endpoint: POST /db-update
@@ -72,6 +78,58 @@ def fetch_cors_headers():
         logger.error(f"Failed to fetch CORS headers: {e}")
         return {}
 
+def validate_and_clean_update_data(update_data):
+    """
+    Validates and cleans update data to ensure it's suitable for DynamoDB operations.
+    Handles edge cases and provides detailed error messages.
+    """
+    if not isinstance(update_data, dict):
+        raise LambdaError(400, "update_data must be a dictionary")
+    
+    if not update_data:
+        raise LambdaError(400, "update_data cannot be empty")
+    
+    cleaned_data = {}
+    invalid_keys = []
+    
+    for key, value in update_data.items():
+        # Validate key
+        if not isinstance(key, str):
+            invalid_keys.append(f"Key '{key}' is not a string")
+            continue
+        
+        if not key.strip():
+            invalid_keys.append("Empty key found")
+            continue
+        
+        # Check for reserved DynamoDB words (basic check)
+        reserved_words = {
+            'name', 'value', 'key', 'item', 'table', 'index', 'attribute', 
+            'expression', 'condition', 'filter', 'projection', 'scan', 'query'
+        }
+        
+        if key.lower() in reserved_words:
+            logger.warning(f"Key '{key}' is a DynamoDB reserved word. This may cause issues.")
+        
+        # Validate value
+        if value is None:
+            cleaned_data[key] = None
+        elif isinstance(value, (str, int, float, bool)):
+            cleaned_data[key] = value
+        elif isinstance(value, (dict, list, tuple)):
+            # Complex types will be serialized to JSON strings
+            cleaned_data[key] = value
+        else:
+            # Convert other types to string
+            cleaned_data[key] = str(value)
+            logger.info(f"Converted value for key '{key}' to string: {value}")
+    
+    if invalid_keys:
+        raise LambdaError(400, f"Invalid keys found: {', '.join(invalid_keys)}")
+    
+    logger.info(f"Validated and cleaned update data: {cleaned_data}")
+    return cleaned_data
+
 def db_update_item(table_name, key_name, key_value, index_name, update_data, account_id, session_id):
     """
     Updates or creates an item in DynamoDB, ensuring user authorization.
@@ -80,12 +138,12 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
     table = dynamodb.Table(table_name)
     
     try:
-        # Validate input parameters
-        if not isinstance(update_data, dict):
-            raise LambdaError(400, "update_data must be a dictionary")
-        
+        # Validate and clean input parameters
         if not isinstance(key_value, (str, int, float, bool)) and key_value is not None:
             raise LambdaError(400, "key_value must be a primitive type (string, number, boolean, or null)")
+        
+        # Validate and clean update_data
+        cleaned_update_data = validate_and_clean_update_data(update_data)
         
         # Check if associated_account is part of the index name
         is_associated_account_key = 'associated_account' in index_name.lower()
@@ -109,18 +167,69 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
             # Create new item - ensure update_data doesn't contain nested dicts
             new_item = {key_name: key_value, 'associated_account': account_id}
             # Use the helper function to serialize update_data
-            serialized_update_data = serialize_for_dynamodb(update_data)
+            serialized_update_data = serialize_for_dynamodb(cleaned_update_data)
             new_item.update(serialized_update_data)
             table.put_item(Item=new_item)
             return {"message": "Successfully created new item.", "operation": "create", "updated_count": 1}
 
         # Update existing items
         # Use the helper function to serialize update_data for DynamoDB compatibility
-        flattened_update_data = serialize_for_dynamodb(update_data)
+        flattened_update_data = serialize_for_dynamodb(cleaned_update_data)
         
-        update_expression = "SET " + ", ".join(f"#{k}=:{k}" for k in flattened_update_data.keys())
-        expression_attribute_names = {f"#{k}": k for k in flattened_update_data.keys()}
-        expression_attribute_values = {f":{k}": v for k, v in flattened_update_data.items()}
+        # Log the update data for debugging
+        logger.info(f"Updating items with data: {flattened_update_data}")
+        
+        # Build update expression with proper attribute name handling and collision resolution
+        update_parts = []
+        expression_attribute_names = {}
+        expression_attribute_values = {}
+        
+        # Track used placeholders to avoid collisions
+        used_placeholders = set()
+        used_attr_names = set()
+        
+        for attr_name, attr_value in flattened_update_data.items():
+            # Create safe attribute name placeholder with collision detection
+            base_placeholder = attr_name.replace('-', '_').replace('.', '_')
+            attr_placeholder = f"#{base_placeholder}"
+            value_placeholder = f":{base_placeholder}"
+            
+            # Handle collisions by adding a counter suffix
+            counter = 1
+            while attr_placeholder in used_placeholders:
+                attr_placeholder = f"#{base_placeholder}_{counter}"
+                value_placeholder = f":{base_placeholder}_{counter}"
+                counter += 1
+            
+            # Handle attribute name collisions by ensuring newer values take precedence
+            if attr_name in used_attr_names:
+                logger.warning(f"Attribute name collision detected for '{attr_name}'. Newer value will take precedence.")
+                # Remove the previous entry for this attribute name
+                for existing_placeholder, existing_attr_name in list(expression_attribute_names.items()):
+                    if existing_attr_name == attr_name:
+                        del expression_attribute_names[existing_placeholder]
+                        # Also remove from expression_attribute_values
+                        for existing_value_placeholder in list(expression_attribute_values.keys()):
+                            if existing_value_placeholder.replace(':', '#') == existing_placeholder.replace('#', ':'):
+                                del expression_attribute_values[existing_value_placeholder]
+                        # Remove from update_parts
+                        update_parts = [part for part in update_parts if not part.startswith(f"{existing_placeholder} =")]
+                        break
+            
+            update_parts.append(f"{attr_placeholder} = {value_placeholder}")
+            expression_attribute_names[attr_placeholder] = attr_name
+            expression_attribute_values[value_placeholder] = attr_value
+            
+            used_placeholders.add(attr_placeholder)
+            used_attr_names.add(attr_name)
+            
+            logger.info(f"Added attribute '{attr_name}' with placeholder '{attr_placeholder}' and value '{attr_value}'")
+        
+        update_expression = "SET " + ", ".join(update_parts)
+        
+        logger.info(f"Final update expression: {update_expression}")
+        logger.info(f"Final expression attribute names: {expression_attribute_names}")
+        logger.info(f"Final expression attribute values: {expression_attribute_values}")
 
         updated_count = 0
         for item in items:
@@ -143,6 +252,9 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
                 logger.warning(f"Skipping item with no valid primary key: {item}")
                 continue
             
+            # Log the item being updated for debugging
+            logger.info(f"Updating item with key {primary_key}, current item: {item}")
+            
             try:
                 table.update_item(
                     Key=primary_key,
@@ -151,6 +263,7 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
                     ExpressionAttributeValues=expression_attribute_values
                 )
                 updated_count += 1
+                logger.info(f"Successfully updated item with key {primary_key}")
             except ClientError as e:
                 logger.error(f"Failed to update item with key {primary_key}: {e}")
                 # Continue with other items instead of failing completely

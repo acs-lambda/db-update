@@ -33,18 +33,48 @@ def serialize_for_dynamodb(data):
     """
     Safely serialize data for DynamoDB operations.
     Converts nested dictionaries, lists, and other complex types to JSON strings.
+    Handles special characters in attribute names and provides detailed logging.
+    Ensures that attribute name collisions are resolved with newer values taking precedence.
     """
+    logger.info(f"Serializing data for DynamoDB: {data}")
+    
     if isinstance(data, dict):
         serialized = {}
+        collision_count = 0
+        
         for k, v in data.items():
+            logger.info(f"Processing attribute '{k}' with value: {v} (type: {type(v)})")
+            
+            # Check for attribute name collisions in the input data
+            if k in serialized:
+                collision_count += 1
+                logger.warning(f"Attribute name collision detected in input data for '{k}'. Newer value will override previous value.")
+            
             if isinstance(v, (dict, list, tuple)):
-                serialized[k] = json.dumps(v)
-            else:
+                # Convert complex types to JSON strings
+                json_str = json.dumps(v)
+                serialized[k] = json_str
+                logger.info(f"Converted complex type to JSON string: '{k}' = '{json_str}'")
+            elif isinstance(v, (int, float, str, bool)) or v is None:
+                # Keep primitive types as-is
                 serialized[k] = v
+                logger.info(f"Kept primitive type as-is: '{k}' = {v}")
+            else:
+                # Convert other types to string
+                serialized[k] = str(v)
+                logger.info(f"Converted to string: '{k}' = '{v}'")
+        
+        if collision_count > 0:
+            logger.info(f"Resolved {collision_count} attribute name collisions in input data")
+        
+        logger.info(f"Serialized result: {serialized}")
         return serialized
     elif isinstance(data, (list, tuple)):
-        return json.dumps(data)
+        json_str = json.dumps(data)
+        logger.info(f"Serialized list/tuple to JSON string: {json_str}")
+        return json_str
     else:
+        logger.info(f"Serialized primitive value: {data}")
         return data
 
 def invoke_lambda(function_name, payload, invocation_type="RequestResponse"):
