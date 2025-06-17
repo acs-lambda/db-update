@@ -115,8 +115,8 @@ def validate_and_clean_update_data(update_data):
 
 def db_update_item(table_name, key_name, key_value, index_name, update_data, account_id, session_id):
     """
-    Updates or creates an item in DynamoDB using put_item with graceful merge strategy.
-    This approach ensures all existing attributes are preserved while adding/updating new ones.
+    Updates or creates an item in DynamoDB using put_item with simple merge strategy.
+    Finds items by key_name/key_value and merges update_data into them.
     """
     
     table = dynamodb.Table(table_name)
@@ -143,27 +143,12 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         logger.info(f"Table key schema: {primary_key_attrs}")
         logger.info(f"Key name: {key_name}, Key value: {key_value}")
         
-        # Check if associated_account is part of the index name
-        is_associated_account_key = 'associated_account' in index_name.lower()
-        
-        # Build the base item with the key attributes
-        base_item = {key_name: key_value}
-        
-        # If associated_account is not part of the key and not in the index, add it
-        if not is_associated_account_key and 'associated_account' not in primary_key_attrs:
-            base_item['associated_account'] = account_id
-        
-        # Query to find existing items that match our criteria
+        # Query to find existing items that match the key
         query_params = {
             'IndexName': index_name,
             'KeyConditionExpression': f"{key_name} = :key_value",
             'ExpressionAttributeValues': {':key_value': key_value}
         }
-        
-        # Only add associated_account filter if it's not part of the index key
-        if not is_associated_account_key:
-            query_params['FilterExpression'] = "associated_account = :account_id"
-            query_params['ExpressionAttributeValues'][':account_id'] = account_id
         
         response = table.query(**query_params)
         existing_items = response.get('Items', [])
@@ -171,8 +156,8 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         logger.info(f"Found {len(existing_items)} existing items")
         
         if not existing_items:
-            # Create new item - merge base item with update data
-            new_item = base_item.copy()
+            # Create new item with key and update data
+            new_item = {key_name: key_value}
             new_item.update(serialized_update_data)
             
             logger.info(f"Creating new item: {new_item}")
@@ -188,11 +173,6 @@ def db_update_item(table_name, key_name, key_value, index_name, update_data, acc
         # Update existing items
         updated_count = 0
         for existing_item in existing_items:
-            # Verify authorization if associated_account is the key
-            if is_associated_account_key and existing_item.get('associated_account') != account_id:
-                logger.warning(f"Skipping item with mismatched associated_account: {existing_item.get('associated_account')} != {account_id}")
-                continue
-            
             # Build the complete item by merging existing item with update data
             merged_item = existing_item.copy()  # Start with all existing attributes
             
